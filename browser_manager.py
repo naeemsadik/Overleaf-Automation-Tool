@@ -11,12 +11,18 @@ class ChromeBrowserManager:
         self.user_data_dir = Path(user_data_dir)
         self.start_maximized = start_maximized
 
-    def create_driver(self) -> webdriver.Chrome:
+    def create_driver(self, headless: bool = False) -> webdriver.Chrome:
         self.user_data_dir.mkdir(parents=True, exist_ok=True)
 
         options = Options()
-        if self.start_maximized:
+        if self.start_maximized and not headless:
             options.add_argument("--start-maximized")
+        
+        if headless:
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1920,1080")
+            
         options.add_argument(f"--user-data-dir={self.user_data_dir}")
         options.add_argument("--remote-allow-origins=*")
         options.add_argument("--disable-blink-features=AutomationControlled")

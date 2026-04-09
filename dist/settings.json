@@ -1,0 +1,8 @@
+{
+    "project_url": "https://www.overleaf.com/latex/templates/united-international-university-fydp-template-department-of-cse/xbkpdgkgjdhc",
+    "user_data_dir": "C:\\Users\\User\\.overleaf_selenium_profile",
+    "share_links_csv_path": "overleaf_share_links.csv",
+    "email_subject_template": "Overleaf Project Edit Access: {project_name}",
+    "email_body_template": "Dear {leader_name},\n\nI hope you are doing well. I am sharing the Overleaf project {project_name} with edit access.\n\nLink: {link}\n\nRegards,\nOverleaf Automation by NAS",
+    "recipients_csv_path": "C:/Users/User/Downloads/data.csv"
+}

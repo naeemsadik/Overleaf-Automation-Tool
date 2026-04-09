@@ -16,17 +16,25 @@ from config import AppConfig
 
 
 @dataclass(frozen=True)
+class TeamMember:
+    name: str
+    email: str
+    student_id: str
+
+
+@dataclass(frozen=True)
 class TeamRecipient:
     team_id: str
     project_title: str
-    team_leader_name: str
-    team_leader_email: str
+    members: list[TeamMember]
+    cc_emails: list[str]
 
 
 class SeleniumWorkflowBase:
-    def __init__(self, driver, config: AppConfig) -> None:
+    def __init__(self, driver, config: AppConfig, stop_event=None) -> None:
         self.driver = driver
         self.config = config
+        self.stop_event = stop_event
         self.wait = WebDriverWait(driver, config.wait_timeout)
 
     def open_page(self, url: str) -> None:
@@ -62,16 +70,21 @@ class SeleniumWorkflowBase:
 class OverleafProjectSharer(SeleniumWorkflowBase):
     def run(self) -> None:
         print("🚀 Starting Smart Overleaf Automation...")
-        self.ensure_logged_in()
-
+        # Note: Initial login check is handled by the caller/manager to support headless transition
+        
         recipients = self.load_recipients()
-        print(f"📄 Loaded {len(recipients)} team rows from CSV.")
+        print(f"📄 Loaded {len(recipients)} team groups from CSV.")
 
         for index, recipient in enumerate(recipients, start=1):
+            if self.stop_event and self.stop_event.is_set():
+                print("\n🛑 Stop signal detected. Breaking automation loop...")
+                break
+
             project_name = f"{recipient.team_id} - {recipient.project_title}"
+            member_names = ", ".join([m.name for m in recipient.members])
             print(
                 f"\n➡️ Processing {index}/{len(recipients)}: "
-                f"{project_name} -> {recipient.team_leader_email}"
+                f"{project_name} -> [{member_names}]"
             )
 
             self.open_project_or_template()
@@ -80,10 +93,9 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
             link = self.set_link_sharing_to_edit_and_copy_link()
             self.save_link_to_csv(link, project_name)
             self.send_email_via_gmail(
-                recipient.team_leader_email,
-                link,
-                project_name,
-                recipient.team_leader_name,
+                recipient=recipient,
+                share_link=link,
+                project_name=project_name
             )
 
         print(f"🏁 Done. Closing in {self.config.post_action_wait_seconds} seconds...")
@@ -100,29 +112,66 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
         recipients: list[TeamRecipient] = []
         with csv_path.open("r", newline="", encoding="utf-8-sig") as csv_file:
             reader = csv.DictReader(csv_file)
+            
+            current_team_id = None
+            current_project_title = None
+            current_members = []
+            current_cc = []
+
             for raw_row in reader:
+                # Normalize keys for robustness
                 row = {self._normalize_header(k): (v or "").strip() for k, v in raw_row.items() if k}
+                
                 team_id = row.get("teamid", "")
                 project_title = row.get("projecttitle", "")
-                team_leader_name = row.get("teamleadername", "")
-                team_leader_email = row.get("teamleaderemail", "")
+                member_name = row.get("teammembers", "") or row.get("teamleadername", "")
+                member_email = row.get("emails", "") or row.get("teamleaderemail", "")
+                student_id = row.get("studentid", "")
+                cc_val = row.get("cc", "")
 
-                if not (team_id and project_title and team_leader_name and team_leader_email):
+                # Skip true header rows if they somehow ended up in data
+                if team_id.lower() == "team_id":
                     continue
 
-                recipients.append(
-                    TeamRecipient(
-                        team_id=team_id,
-                        project_title=project_title,
-                        team_leader_name=team_leader_name,
-                        team_leader_email=team_leader_email,
-                    )
-                )
+                if team_id:
+                    # Save previous team if exists
+                    if current_team_id:
+                        recipients.append(TeamRecipient(
+                            team_id=current_team_id,
+                            project_title=current_project_title,
+                            members=current_members,
+                            cc_emails=current_cc
+                        ))
+                    
+                    # Start new team
+                    current_team_id = team_id
+                    current_project_title = project_title
+                    current_members = []
+                    current_cc = []
+
+                if member_name and member_email:
+                    current_members.append(TeamMember(name=member_name, email=member_email, student_id=student_id))
+                
+                if cc_val:
+                    # Split by comma or semicolon if multiple CCs in one cell
+                    ccs = [c.strip() for c in cc_val.replace(";", ",").split(",") if c.strip()]
+                    for c in ccs:
+                        if c not in current_cc:
+                            current_cc.append(c)
+
+            # Add last team
+            if current_team_id:
+                recipients.append(TeamRecipient(
+                    team_id=current_team_id,
+                    project_title=current_project_title,
+                    members=current_members,
+                    cc_emails=current_cc
+                ))
 
         if not recipients:
             raise ValueError(
-                "No valid rows found in recipient CSV. "
-                "Required columns: team_id, project_title, team leader name, team leader email"
+                "No valid teams found in recipient CSV. "
+                "Required columns: team_id, project_title, team_members/team leader name, emails/team leader email"
             )
         return recipients
 
@@ -130,18 +179,26 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
     def _normalize_header(value: str) -> str:
         return "".join(ch for ch in value.lower() if ch.isalnum())
 
-    def ensure_logged_in(self) -> None:
-        print("🔍 Checking login status...")
+    def ensure_logged_in(self) -> bool:
+        """Returns True if manual login was required and performed."""
+        print("🔍 Checking Overleaf login status...")
         self.open_page(self.config.dashboard_url)
-        time.sleep(3)
+        
+        # dynamic wait instead of sleep(3)
+        try:
+            self.wait_for_visible(By.XPATH, "//button[contains(., 'Project') or contains(., 'New Project') or contains(@class, 'user-menu')]", timeout=8)
+        except:
+            pass
 
         if "/login" in self.driver.current_url:
-            print("🔑 Not logged in. Please log in manually now...")
+            print("🔑 Overleaf: Not logged in. Please log in manually now...")
             while "/login" in self.driver.current_url:
                 time.sleep(self.config.login_poll_interval)
-            print("✅ Login completed!")
+            print("✅ Overleaf login completed!")
+            return True # Login was required
         else:
-            print("✅ Already logged in! Skipping login step.")
+            print("✅ Overleaf: Already logged in.")
+            return False
 
     def open_project_or_template(self) -> None:
         print(f"🔗 Moving to project: {self.config.project_url}")
@@ -191,32 +248,24 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                 )
 
                 # Never type into the active element directly, because focus can land on the LaTeX editor.
-                rename_input = self._find_rename_input(timeout=6)
+                rename_input = self._find_rename_input(timeout=5)
                 rename_input.click()
                 rename_input.send_keys(Keys.CONTROL, "a")
                 rename_input.send_keys(Keys.BACKSPACE)
                 rename_input.send_keys(new_name)
                 rename_input.send_keys(Keys.ENTER)
-                time.sleep(1)
-                if self._current_project_name() == new_name:
-                    print("✅ Project renamed.")
-                    return
-            except Exception as error:
-                last_error = error
-                try:
-                    rename_input = self._find_rename_input(timeout=4)
-                    rename_input.click()
-                    rename_input.send_keys(Keys.CONTROL, "a")
-                    rename_input.send_keys(Keys.BACKSPACE)
-                    rename_input.send_keys(new_name)
-                    rename_input.send_keys(Keys.ENTER)
-                    time.sleep(1)
+                
+                # Dynamic wait for name change
+                deadline = time.time() + 3
+                while time.time() < deadline:
                     if self._current_project_name() == new_name:
                         print("✅ Project renamed.")
                         return
-                except Exception:
-                    pass
-                time.sleep(0.5)
+                    time.sleep(0.3)
+                    
+            except Exception as error:
+                last_error = error
+                time.sleep(0.3)
 
         print(f"⚠️ Rename did not complete. Continuing workflow. Last error: {last_error}")
 
@@ -266,7 +315,7 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                 timeout=2,
             )
             button.click()
-            time.sleep(0.8)
+            time.sleep(0.4)
             return
         except Exception:
             # Link sharing may already be enabled, which is acceptable.
@@ -303,7 +352,10 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
 
     @staticmethod
     def _looks_like_overleaf_link(value: str) -> bool:
-        return bool(value and "overleaf.com" in value and ("/project/" in value or "/read/" in value))
+        if not value or "overleaf.com" not in value:
+            return False
+        # Accept short links (e.g., overleaf.com/123xyz) or project/read links
+        return "/" in value.split("overleaf.com/")[1] or len(value.split("overleaf.com/")[1]) > 5
 
     def _extract_share_link_quick_dom(self) -> str:
         try:
@@ -379,16 +431,23 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
 
     def send_email_via_gmail(
         self,
-        recipient_email: str,
+        recipient: TeamRecipient,
         share_link: str,
         project_name: str,
-        leader_name: str,
     ) -> None:
-        print(f"📨 Sending Gmail message to: {recipient_email}")
+        all_emails = [m.email for m in recipient.members]
+        to_field = ", ".join(all_emails)
+        cc_field = ", ".join(recipient.cc_emails)
+        
+        print(f"📨 Sending Gmail message to: {to_field}")
+        if cc_field:
+            print(f"📎 CC: {cc_field}")
+
         subject = self.config.email_subject_template.format(
             project_name=project_name,
             link=share_link,
-            leader_name=leader_name,
+            # For backward compatibility if someone used {leader_name} in subject
+            leader_name=recipient.members[0].name if recipient.members else "Team"
         )
 
         current_window = self.driver.current_window_handle
@@ -411,8 +470,32 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                 timeout=20,
             )
             to_input.click()
-            to_input.send_keys(recipient_email)
+            to_input.send_keys(to_field)
             to_input.send_keys(Keys.ENTER)
+
+            if cc_field:
+                # Click CC button if available or use shortcut
+                time.sleep(0.5)
+                try:
+                    cc_trigger = self.driver.find_element(By.XPATH, "//span[@role='link' and contains(., 'Cc')]")
+                    cc_trigger.click()
+                except:
+                    # Try shortcut Ctrl+Shift+C
+                    ActionChains(self.driver).key_down(Keys.CONTROL).key_down(Keys.SHIFT).send_keys("c").key_up(Keys.SHIFT).key_up(Keys.CONTROL).perform()
+                
+                time.sleep(0.5)
+                cc_input = self._find_first_visible(
+                    [
+                        (By.CSS_SELECTOR, "div[role='dialog'] textarea[name='cc']"),
+                        (By.CSS_SELECTOR, "div[role='dialog'] input[aria-label='Cc recipients']"),
+                        (By.CSS_SELECTOR, "textarea[name='cc']"),
+                        (By.CSS_SELECTOR, "input[aria-label='Cc recipients']"),
+                    ],
+                    timeout=5,
+                )
+                cc_input.click()
+                cc_input.send_keys(cc_field)
+                cc_input.send_keys(Keys.ENTER)
 
             subject_input = self._find_first_visible(
                 [
@@ -426,7 +509,7 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
             subject_input.send_keys(Keys.BACKSPACE)
             subject_input.send_keys(subject)
 
-            body = self._find_first_visible(
+            body_el = self._find_first_visible(
                 [
                     (By.CSS_SELECTOR, "div[role='dialog'] div[aria-label='Message Body']"),
                     (By.CSS_SELECTOR, "div[role='dialog'] div[role='textbox'][aria-label='Message Body']"),
@@ -434,8 +517,9 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                 ],
                 timeout=20,
             )
-            body.click()
-            body.send_keys(self._build_plain_email_body(project_name, share_link, leader_name))
+            body_el.click()
+            body_content = self._build_plain_email_body(recipient, share_link, project_name)
+            body_el.send_keys(body_content)
 
             send_button = self._find_first_clickable(
                 [
@@ -516,12 +600,24 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
         raise TimeoutException("No matching clickable element found.")
 
 
-    def _build_plain_email_body(self, project_name: str, share_link: str, leader_name: str) -> str:
-        return self.config.email_body_template.format(
+    def _build_plain_email_body(self, recipient: TeamRecipient, share_link: str, project_name: str) -> str:
+        member_list_str = "\n".join([f"- {m.name} ({m.email})" for m in recipient.members])
+        
+        # We try to use the leader name if it was in the template, otherwise first member
+        leader_name = recipient.members[0].name if recipient.members else "Team"
+        
+        body = self.config.email_body_template.format(
             project_name=project_name,
             link=share_link,
             leader_name=leader_name,
+            team_members=member_list_str # New placeholder
         )
+        
+        # If the user didn't have {team_members} in their template yet, we append it
+        if "{team_members}" not in self.config.email_body_template:
+            body += f"\n\nTeam Members:\n{member_list_str}"
+            
+        return body
 
     def ensure_gmail_logged_in(self) -> None:
         print("🔍 Checking Gmail login status...")

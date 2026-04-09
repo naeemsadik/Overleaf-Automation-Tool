@@ -1,3 +1,16 @@
-team_id,project_title,team leader name,team leader email
-I7,Test Project 1,Naeem Abdullah Sadik,nsadik222115@bscse.uiu.ac.bd
-I8,Test Project 1,Samiul Haque Rudra,srudra221023@bscse.uiu.ac.bd
+team_id,section,project_title,team_members,student_id,emails
+I-7,I,Test Project for I7,Naeem Abdullah Sadik,11222115,nsadik222115@bscse.uiu.ac.bd
+,,,Samiul Haque Rudra,11221023,srudra221023@bscse.uiu.ac.bd
+,,,Mr ABCD,118513215,noemail@gmail.com
+,,,Ms EFGH,115121842,noemail3@gmail.com
+I-8,I,Test Project for I8,Samiul Haque Rudra,11221023,srudra221023@bscse.uiu.ac.bd
+,,,Naeem Abdullah Sadik,11222115,nsadik222115@bscse.uiu.ac.bd
+,,,Mr ABCD,118513215,noemail@gmail.com
+,,,Ms EFGH,115121842,noemail2@gmail.com
+,,,Ms EFGH,115121842,noemail3@gmail.com
+I-9,I,Test Project I9,Samiul Haque Rudra,11221023,srudra221023@bscse.uiu.ac.bd
+,,,Naeem Abdullah Sadik,11222115,nsadik222115@bscse.uiu.ac.bd
+,,,Mr ABCD,118513215,noemail@gmail.com
+,,,Ms EFGH,115121842,noemail2@gmail.com
+,,,Ms EFGH,115121842,noemail3@gmail.com
+,,,Ms EFGH,115121842,noemail4@gmail.com
