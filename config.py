@@ -5,6 +5,20 @@ import os
 from dotenv import find_dotenv, load_dotenv
 
 
+def _normalize_project_url(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+
+    # Some saved settings accidentally concatenate the same URL twice without a separator.
+    # If the string is an exact repetition, collapse it back to a single URL.
+    half_length = len(text) // 2
+    if len(text) % 2 == 0 and half_length > 0 and text[:half_length] == text[half_length:]:
+        return text[:half_length]
+
+    return text
+
+
 @dataclass(frozen=True)
 class AppConfig:
     project_url: str
@@ -38,10 +52,10 @@ class AppConfig:
     @classmethod
     def from_dict(cls, data: dict) -> "AppConfig":
         """Creates a config from a dictionary (e.g. from JSON settings)."""
-        user_data_dir = Path(data.get("user_data_dir", str(Path.home() / ".overleaf_selenium_profile"))).expanduser()
+        user_data_dir = Path(data.get("user_data_dir", str(Path.home() / ".leafpilot_chrome_profile"))).expanduser()
         
         return cls(
-            project_url=data.get("project_url", ""),
+            project_url=_normalize_project_url(data.get("project_url", "")),
             user_data_dir=user_data_dir,
             recipients_csv_path=Path(data.get("recipients_csv_path", "data.csv")),
             target_email=data.get("target_email"),
@@ -96,6 +110,8 @@ class AppConfig:
         # Validation for required fields only if using env
         if "project_url" not in env_dict:
             raise ValueError("Missing required environment variable: OVERLEAF_PROJECT_URL")
+
+        env_dict["project_url"] = _normalize_project_url(env_dict.get("project_url"))
             
         return cls.from_dict(env_dict)
 
@@ -107,4 +123,4 @@ def _required_env(name: str) -> str:
             f"Missing required environment variable: {name}. "
             f"Create a .env file based on .env.example and set {name}."
         )
-    return value
+    return value

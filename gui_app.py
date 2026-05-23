@@ -4,6 +4,7 @@ import json
 import threading
 import sys
 import os
+import traceback
 from pathlib import Path
 import csv
 from datetime import datetime
@@ -13,6 +14,7 @@ from PIL import Image, ImageTk
 from config import AppConfig
 from browser_manager import ChromeBrowserManager
 from overleaf_automation import OverleafProjectSharer
+from config import _normalize_project_url
 
 SETTINGS_FILE = "settings.json"
 
@@ -149,6 +151,17 @@ class LeafPilotGUI:
         
         self.stop_btn = ttk.Button(ctrl_frame, text="🛑 STOP", style="Stop.TButton", command=self.stop_automation, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT)
+
+        self.headless_var = tk.BooleanVar(value=bool(self.settings.get("headless_mode", False)))
+        self.pending_headless: bool | None = None
+        self.mode_change_requested = threading.Event()
+        self.headless_check = ttk.Checkbutton(
+            ctrl_frame,
+            text="Headless Mode",
+            variable=self.headless_var,
+            command=self.on_headless_toggle,
+        )
+        self.headless_check.pack(side=tk.LEFT, padx=(10, 0))
         
         self.status_var = tk.StringVar(value="Ready to start.")
         tk.Label(ctrl_frame, textvariable=self.status_var, font=("Segoe UI", 9), fg="#64748b", bg=self.bg_color).pack(side=tk.RIGHT)
@@ -227,23 +240,29 @@ class LeafPilotGUI:
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, 'r') as f:
-                    return json.load(f)
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict) and "project_url" in loaded:
+                        loaded["project_url"] = _normalize_project_url(loaded.get("project_url"))
+                    return loaded
             except:
                 pass
         
         return {
             "project_url": "",
-            "user_data_dir": str(Path.home() / ".overleaf_selenium_profile"),
+            "user_data_dir": str(Path.home() / ".leafpilot_chrome_profile"),
             "recipients_csv_path": "",
             "share_links_csv_path": "overleaf_share_links.csv",
             "email_subject_template": "Overleaf Project Edit Access: {project_name}",
-            "email_body_template": "Dear {leader_name},\n\nI hope you are doing well. I am sharing the Overleaf project {project_name} with edit access.\n\nLink: {link}\n\nTeam Members:\n{team_members}\n\nRegards,\nLeafPilot Automation"
+            "email_body_template": "Dear {leader_name},\n\nI hope you are doing well. I am sharing the Overleaf project {project_name} with edit access.\n\nLink: {link}\n\nTeam Members:\n{team_members}\n\nRegards,\nLeafPilot Automation",
+            "headless_mode": False,
         }
 
     def save_settings(self):
         new_settings = {k: v.get() for k, v in self.vars.items()}
+        new_settings["project_url"] = _normalize_project_url(new_settings.get("project_url"))
         new_settings["email_body_template"] = self.email_body_text.get("1.0", tk.END).strip()
         new_settings["recipients_csv_path"] = self.csv_path_var.get()
+        new_settings["headless_mode"] = bool(self.headless_var.get())
         
         with open(SETTINGS_FILE, 'w') as f:
             json.dump(new_settings, f, indent=4)
@@ -267,6 +286,8 @@ class LeafPilotGUI:
         self.log_widget.configure(state='disabled')
         self.status_var.set("Automation in progress...")
         self.stop_event.clear()
+        self.pending_headless = None
+        self.mode_change_requested.clear()
         
         print("Initializing LeafPilot Automation...")
         self.automation_thread = threading.Thread(target=self.run_workflow, daemon=True)
@@ -278,11 +299,20 @@ class LeafPilotGUI:
         self.stop_btn.configure(state=tk.DISABLED)
         self.status_var.set("Stopping (waiting for clean break)...")
 
+    def on_headless_toggle(self):
+        if self.automation_thread and self.automation_thread.is_alive():
+            self.pending_headless = bool(self.headless_var.get())
+            self.mode_change_requested.set()
+            print("\n🔄 Mode change requested. Will apply after current team finishes...")
+        else:
+            self.pending_headless = None
+
     def run_workflow(self):
         try:
             config_data = {k: v.get() for k, v in self.vars.items()}
             config_data["email_body_template"] = self.email_body_text.get("1.0", tk.END).strip()
             config_data["recipients_csv_path"] = self.csv_path_var.get()
+            config_data["headless_mode"] = bool(self.headless_var.get())
             
             config = AppConfig.from_dict(config_data)
             
@@ -291,28 +321,93 @@ class LeafPilotGUI:
                 start_maximized=config.start_maximized,
             )
 
+            # Warn if the user set the real Chrome profile — we redirect automatically.
+            real_chrome = str(Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data")
+            if str(config.user_data_dir).lower() == real_chrome.lower():
+                print("⚠️  Real Chrome profile detected — using dedicated LeafPilot profile instead.")
+                print(f"   Profile: {Path.home() / '.leafpilot_chrome_profile'}")
+                print("   (You may need to log in to Overleaf/Gmail on first run)")
+
             driver = None
             try:
-                # 1. Start in HEADED mode
-                print("🔍 Phase 1: Checking login/manual session (Headed mode)...")
-                driver = browser_manager.create_driver(headless=False)
-                automation = OverleafProjectSharer(driver, config, stop_event=self.stop_event)
-                
-                automation.ensure_logged_in()
-                automation.ensure_gmail_logged_in()
-                
-                # Check for stop signal after headed phase
-                if self.stop_event.is_set():
-                    return
+                headless = bool(self.headless_var.get())
 
-                # 2. Transition to HEADLESS
-                print("🔄 Phase 2: Transitioning to Headless mode for automation...")
-                browser_manager.quit_driver(driver)
-                
-                driver = browser_manager.create_driver(headless=True)
-                automation = OverleafProjectSharer(driver, config, stop_event=self.stop_event)
-                
-                automation.run()
+                def _create_driver_with_login(use_headless: bool):
+                    """
+                    Launch Chrome and verify both logins.
+                    - Non-headless: single launch, check login directly in that window.
+                    - Headless: open a visible window first for manual login if needed,
+                      then relaunch headless and do a quick login verification.
+                    """
+                    if use_headless:
+                        print("🔍 Headless mode: verifying login in a visible browser first...")
+                        headed_driver = browser_manager.create_driver(headless=False)
+                        headed_automation = OverleafProjectSharer(
+                            headed_driver,
+                            config,
+                            stop_event=self.stop_event,
+                        )
+                        headed_automation.ensure_logged_in()
+                        headed_automation.ensure_gmail_logged_in()
+                        browser_manager.quit_driver(headed_driver)
+
+                        new_driver = browser_manager.create_driver(headless=True)
+                        new_automation = OverleafProjectSharer(
+                            new_driver,
+                            config,
+                            stop_event=self.stop_event,
+                        )
+                        # Quick sanity check in headless — no manual login possible here
+                        new_automation.ensure_logged_in()
+                        new_automation.ensure_gmail_logged_in()
+                    else:
+                        new_driver = browser_manager.create_driver(headless=False)
+                        new_automation = OverleafProjectSharer(
+                            new_driver,
+                            config,
+                            stop_event=self.stop_event,
+                        )
+                        new_automation.ensure_logged_in()
+                        new_automation.ensure_gmail_logged_in()
+
+                    return new_driver, new_automation
+
+                recipients = []
+                print("🔍 Launching browser and checking login status...")
+                driver, automation = _create_driver_with_login(headless)
+
+                print("🔍 Loading recipients...")
+                recipients = automation.load_recipients()
+                print(f"📄 Loaded {len(recipients)} team groups from CSV.")
+
+                for index, recipient in enumerate(recipients, start=1):
+                    if self.stop_event.is_set():
+                        break
+
+                    project_name = automation.build_project_name(recipient)
+                    print(
+                        f"\n➡️ Processing {index}/{len(recipients)}: "
+                        f"{project_name} -> {len(recipient.members)} recipients"
+                    )
+
+                    automation.open_project_or_template()
+                    automation.rename_project(project_name)
+                    automation.open_share_dialog()
+                    link = automation.set_link_sharing_to_edit_and_copy_link()
+                    automation.save_link_to_csv(link, project_name)
+                    automation.send_email_via_gmail(
+                        recipient=recipient,
+                        share_link=link,
+                        project_name=project_name,
+                    )
+
+                    if self.mode_change_requested.is_set():
+                        self.mode_change_requested.clear()
+                        new_headless = bool(self.pending_headless)
+                        self.pending_headless = None
+                        print("\n🔄 Applying mode change for next team...")
+                        browser_manager.quit_driver(driver)
+                        driver, automation = _create_driver_with_login(new_headless)
                 
                 if self.stop_event.is_set():
                     print("\n🛑 Automation stopped by user.")
@@ -320,6 +415,8 @@ class LeafPilotGUI:
                     print("\n✅ ALL TASKS COMPLETED SUCCESSFULLY.")
             except Exception as e:
                 print(f"\n❌ ERROR: {e}")
+                # Print full traceback to the UI log for easier debugging
+                print(traceback.format_exc())
             finally:
                 browser_manager.quit_driver(driver)
                 

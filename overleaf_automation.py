@@ -1,5 +1,6 @@
 import time
 import csv
+import ctypes
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 from config import AppConfig
 
 
+class ManualLoginRequired(RuntimeError):
+    """Raised when a manual browser login is required during automation."""
+    pass
+
+
 @dataclass(frozen=True)
 class TeamMember:
     name: str
@@ -26,6 +32,7 @@ class TeamMember:
 class TeamRecipient:
     team_id: str
     project_title: str
+    supervisor_name: str
     members: list[TeamMember]
     cc_emails: list[str]
 
@@ -40,14 +47,17 @@ class SeleniumWorkflowBase:
     def open_page(self, url: str) -> None:
         self.driver.get(url)
 
-    def wait_for_clickable(self, by: By, selector: str):
-        return self.wait.until(EC.element_to_be_clickable((by, selector)))
+    def wait_for_clickable(self, by: By, selector: str, timeout: int | None = None):
+        wait = WebDriverWait(self.driver, timeout) if timeout is not None else self.wait
+        return wait.until(EC.element_to_be_clickable((by, selector)))
 
-    def wait_for_visible(self, by: By, selector: str):
-        return self.wait.until(EC.visibility_of_element_located((by, selector)))
+    def wait_for_visible(self, by: By, selector: str, timeout: int | None = None):
+        wait = WebDriverWait(self.driver, timeout) if timeout is not None else self.wait
+        return wait.until(EC.visibility_of_element_located((by, selector)))
 
-    def wait_for_present(self, by: By, selector: str):
-        return self.wait.until(EC.presence_of_element_located((by, selector)))
+    def wait_for_present(self, by: By, selector: str, timeout: int | None = None):
+        wait = WebDriverWait(self.driver, timeout) if timeout is not None else self.wait
+        return wait.until(EC.presence_of_element_located((by, selector)))
 
     def wait_for_text(self, text: str) -> bool:
         self.wait.until(EC.presence_of_element_located((By.XPATH, f"//*[contains(text(), '{text}')]")))
@@ -68,6 +78,9 @@ class SeleniumWorkflowBase:
 
 
 class OverleafProjectSharer(SeleniumWorkflowBase):
+    class ManualLoginRequired(RuntimeError):
+        pass
+
     def run(self) -> None:
         print("🚀 Starting Smart Overleaf Automation...")
         # Note: Initial login check is handled by the caller/manager to support headless transition
@@ -80,7 +93,7 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                 print("\n🛑 Stop signal detected. Breaking automation loop...")
                 break
 
-            project_name = f"{recipient.team_id} - {recipient.project_title}"
+            project_name = self.build_project_name(recipient)
             member_names = ", ".join([m.name for m in recipient.members])
             print(
                 f"\n➡️ Processing {index}/{len(recipients)}: "
@@ -101,6 +114,10 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
         print(f"🏁 Done. Closing in {self.config.post_action_wait_seconds} seconds...")
         time.sleep(self.config.post_action_wait_seconds)
 
+    def build_project_name(self, recipient: TeamRecipient) -> str:
+        supervisor = recipient.supervisor_name or "Supervisor"
+        return f"{recipient.team_id} || {recipient.project_title} || {supervisor}"
+
     def load_recipients(self) -> list[TeamRecipient]:
         csv_path = self.config.recipients_csv_path.expanduser()
         if not csv_path.is_absolute():
@@ -117,17 +134,41 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
             current_project_title = None
             current_members = []
             current_cc = []
+            current_supervisor = ""
 
             for raw_row in reader:
                 # Normalize keys for robustness
                 row = {self._normalize_header(k): (v or "").strip() for k, v in raw_row.items() if k}
                 
-                team_id = row.get("teamid", "")
-                project_title = row.get("projecttitle", "")
-                member_name = row.get("teammembers", "") or row.get("teamleadername", "")
-                member_email = row.get("emails", "") or row.get("teamleaderemail", "")
+                # Support multiple CSV header variants: legacy 'teamid'/'projecttitle',
+                # and newer 'groupname'/'title'. Also support 'members' + 'memberemails'.
+                team_id = row.get("teamid", "") or row.get("groupname", "")
+                project_title = row.get("projecttitle", "") or row.get("title", "")
+                supervisor_name = row.get("supervisor", "")
+
+                # Member name(s) can be in 'teammembers' or 'members'; emails in 'emails' or 'memberemails'
+                member_cell = row.get("teammembers", "") or row.get("members", "") or row.get("teamleadername", "")
+                member_email_cell = row.get("emails", "") or row.get("memberemails", "") or row.get("teamleaderemail", "")
                 student_id = row.get("studentid", "")
-                cc_val = row.get("cc", "")
+                cc_val = row.get("cc", "") or row.get("supervisoremail", "")
+
+                # Normalize member names: many exports include IDs with names in parentheses,
+                # e.g. "011222086 (Alisha Johura), 011212001 (Abu Henaf...)". Extract names inside parentheses.
+                member_names = []
+                if member_cell:
+                    import re
+
+                    # find names in parentheses
+                    paren_names = re.findall(r"\(([^)]+)\)", member_cell)
+                    if paren_names:
+                        member_names = [n.strip() for n in paren_names if n.strip()]
+                    else:
+                        # fallback: split on commas
+                        member_names = [m.strip() for m in member_cell.split(",") if m.strip()]
+
+                # Normalize emails: may be comma/semicolon/newline-separated.
+                # Use a real newline split instead of matching the letter 'n'.
+                member_emails = self._split_email_list(member_email_cell)
 
                 # Skip true header rows if they somehow ended up in data
                 if team_id.lower() == "team_id":
@@ -139,22 +180,33 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                         recipients.append(TeamRecipient(
                             team_id=current_team_id,
                             project_title=current_project_title,
+                            supervisor_name=current_supervisor,
                             members=current_members,
                             cc_emails=current_cc
                         ))
                     
                     # Start new team
                     current_team_id = team_id
-                    current_project_title = project_title
+                    current_project_title = project_title or "Untitled"
                     current_members = []
                     current_cc = []
+                    current_supervisor = supervisor_name or "Supervisor"
 
-                if member_name and member_email:
-                    current_members.append(TeamMember(name=member_name, email=member_email, student_id=student_id))
-                
+                if supervisor_name and not current_supervisor:
+                    current_supervisor = supervisor_name
+
+                # Pair parsed member names with emails (if available). If counts differ,
+                # fill missing names with empty string and still include emails.
+                max_count = max(len(member_names), len(member_emails))
+                for i in range(max_count):
+                    name = member_names[i] if i < len(member_names) else ""
+                    email = member_emails[i] if i < len(member_emails) else ""
+                    if email:
+                        current_members.append(TeamMember(name=name or email, email=email, student_id=student_id))
+
                 if cc_val:
                     # Split by comma or semicolon if multiple CCs in one cell
-                    ccs = [c.strip() for c in cc_val.replace(";", ",").split(",") if c.strip()]
+                    ccs = self._split_email_list(cc_val)
                     for c in ccs:
                         if c not in current_cc:
                             current_cc.append(c)
@@ -164,20 +216,51 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                 recipients.append(TeamRecipient(
                     team_id=current_team_id,
                     project_title=current_project_title,
+                    supervisor_name=current_supervisor,
                     members=current_members,
                     cc_emails=current_cc
                 ))
 
         if not recipients:
-            raise ValueError(
-                "No valid teams found in recipient CSV. "
-                "Required columns: team_id, project_title, team_members/team leader name, emails/team leader email"
+            # Read a small sample of the CSV to help debugging
+            sample_lines = []
+            try:
+                with csv_path.open("r", encoding="utf-8-sig", errors="replace") as f:
+                    for _ in range(10):
+                        line = f.readline()
+                        if not line:
+                            break
+                        sample_lines.append(line.strip())
+            except Exception:
+                sample_lines = ["(could not read sample lines)"]
+
+            # Detect headers present in the file
+            detected_headers = []
+            try:
+                with csv_path.open("r", encoding="utf-8-sig", errors="replace") as f:
+                    header_line = f.readline()
+                    detected_headers = [h.strip() for h in header_line.split(",") if h.strip()]
+            except Exception:
+                detected_headers = []
+
+            detail = (
+                f"No valid teams found in recipient CSV: {csv_path}\n"
+                f"Detected headers: {detected_headers}\n"
+                f"Sample lines (up to 10):\n" + "\n".join(sample_lines)
             )
+            raise ValueError(detail)
         return recipients
 
     @staticmethod
     def _normalize_header(value: str) -> str:
         return "".join(ch for ch in value.lower() if ch.isalnum())
+
+    @staticmethod
+    def _split_email_list(value: str) -> list[str]:
+        import re
+
+        parts = re.split(r"[;,\n]+", value or "")
+        return [part.strip() for part in parts if part.strip()]
 
     def ensure_logged_in(self) -> bool:
         """Returns True if manual login was required and performed."""
@@ -215,10 +298,26 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
             By.XPATH,
             "//a[contains(@href, '/project/new/template/') and contains(normalize-space(.), 'Open as Template')]",
         )
+
+        template_href = ""
+        try:
+            template_href = (open_as_template_button.get_attribute("href") or "").strip()
+        except Exception:
+            template_href = ""
+
+        if template_href:
+            self.open_page(template_href)
+            return
+
         try:
             open_as_template_button.click()
         except Exception:
-            self.driver.execute_script("arguments[0].click();", open_as_template_button)
+            try:
+                self.driver.execute_script("arguments[0].click();", open_as_template_button)
+            except Exception:
+                # Last resort: navigate to the current element target via JS location.
+                if template_href:
+                    self.open_page(template_href)
 
     def wait_for_editor(self) -> None:
         print("⏳ Loading editor...")
@@ -435,13 +534,13 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
         share_link: str,
         project_name: str,
     ) -> None:
-        all_emails = [m.email for m in recipient.members]
-        to_field = ", ".join(all_emails)
-        cc_field = ", ".join(recipient.cc_emails)
-        
-        print(f"📨 Sending Gmail message to: {to_field}")
-        if cc_field:
-            print(f"📎 CC: {cc_field}")
+        all_emails = self._dedupe_emails([m.email for m in recipient.members])
+        cc_emails = self._dedupe_emails(recipient.cc_emails)
+        cc_emails = [email for email in cc_emails if email not in all_emails]
+
+        print(f"📨 Sending Gmail message to: {', '.join(all_emails)}")
+        if cc_emails:
+            print(f"📎 CC: {', '.join(cc_emails)}")
 
         subject = self.config.email_subject_template.format(
             project_name=project_name,
@@ -450,10 +549,26 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
             leader_name=recipient.members[0].name if recipient.members else "Team"
         )
 
-        current_window = self.driver.current_window_handle
+        current_window = None
+        try:
+            current_window = self.driver.current_window_handle
+        except Exception:
+            current_window = None
 
-        self.driver.execute_script("window.open(arguments[0], '_blank');", self.config.gmail_inbox_url)
-        self.driver.switch_to.window(self.driver.window_handles[-1])
+        # Try to open Gmail in a Selenium-managed new tab where possible.
+        try:
+            try:
+                self.driver.switch_to.new_window('tab')
+                self.open_page(self.config.gmail_inbox_url)
+            except Exception:
+                self.driver.execute_script("window.open(arguments[0], '_blank');", self.config.gmail_inbox_url)
+                self.driver.switch_to.window(self.driver.window_handles[-1])
+        except Exception:
+            # Fall back to opening in the current window if tab creation fails.
+            try:
+                self.open_page(self.config.gmail_inbox_url)
+            except Exception:
+                pass
         try:
             self.ensure_gmail_logged_in()
 
@@ -470,32 +585,12 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                 timeout=20,
             )
             to_input.click()
-            to_input.send_keys(to_field)
-            to_input.send_keys(Keys.ENTER)
+            self._fill_gmail_recipients(to_input, all_emails)
 
-            if cc_field:
-                # Click CC button if available or use shortcut
-                time.sleep(0.5)
-                try:
-                    cc_trigger = self.driver.find_element(By.XPATH, "//span[@role='link' and contains(., 'Cc')]")
-                    cc_trigger.click()
-                except:
-                    # Try shortcut Ctrl+Shift+C
-                    ActionChains(self.driver).key_down(Keys.CONTROL).key_down(Keys.SHIFT).send_keys("c").key_up(Keys.SHIFT).key_up(Keys.CONTROL).perform()
-                
-                time.sleep(0.5)
-                cc_input = self._find_first_visible(
-                    [
-                        (By.CSS_SELECTOR, "div[role='dialog'] textarea[name='cc']"),
-                        (By.CSS_SELECTOR, "div[role='dialog'] input[aria-label='Cc recipients']"),
-                        (By.CSS_SELECTOR, "textarea[name='cc']"),
-                        (By.CSS_SELECTOR, "input[aria-label='Cc recipients']"),
-                    ],
-                    timeout=5,
-                )
+            if cc_emails:
+                cc_input = self._ensure_gmail_cc_input()
                 cc_input.click()
-                cc_input.send_keys(cc_field)
-                cc_input.send_keys(Keys.ENTER)
+                self._fill_gmail_recipients(cc_input, cc_emails)
 
             subject_input = self._find_first_visible(
                 [
@@ -521,28 +616,27 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
             body_content = self._build_plain_email_body(recipient, share_link, project_name)
             body_el.send_keys(body_content)
 
-            send_button = self._find_first_clickable(
-                [
-                    (
-                        By.XPATH,
-                        "//div[@role='dialog']//div[@role='button' and (@data-tooltip='Send \\u202a(Ctrl-Enter)\\u202c' or @aria-label='Send \\u202a(Ctrl-Enter)\\u202c' or @data-tooltip='Send' or @aria-label='Send')]",
-                    ),
-                    (
-                        By.XPATH,
-                        "//div[@role='dialog']//div[@role='button' and contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'send')]",
-                    ),
-                ],
-                timeout=20,
-            )
-            send_button.click()
-            self._wait_for_gmail_sent_confirmation()
+            self._send_gmail_message_with_confirmation(body_el)
             print("✅ Gmail message sent.")
         finally:
+            # Close the Gmail tab if present and switch back to the original window.
             try:
-                if len(self.driver.window_handles) > 1:
-                    self.driver.close()
-            finally:
-                self.driver.switch_to.window(current_window)
+                if current_window and len(self.driver.window_handles) > 1:
+                    try:
+                        self.driver.close()
+                    except Exception:
+                        pass
+                    try:
+                        self.driver.switch_to.window(current_window)
+                    except Exception:
+                        # If original window handle is gone, switch to any available window.
+                        try:
+                            if self.driver.window_handles:
+                                self.driver.switch_to.window(self.driver.window_handles[0])
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
     def _open_gmail_compose_modal(self) -> None:
         compose_button = self._find_first_clickable(
@@ -561,19 +655,97 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
             timeout=20,
         )
 
-    def _wait_for_gmail_sent_confirmation(self) -> None:
+    def _send_gmail_message_with_confirmation(self, body_el) -> None:
+        initial_compose_count = self._count_open_compose_dialogs()
+
+        selectors = [
+            (
+                By.XPATH,
+                "(//div[@role='dialog'])[last()]//div[@role='button' and (@data-tooltip='Send \\u202a(Ctrl-Enter)\\u202c' or @aria-label='Send \\u202a(Ctrl-Enter)\\u202c' or @data-tooltip='Send' or @aria-label='Send')]",
+            ),
+            (
+                By.XPATH,
+                "(//div[@role='dialog'])[last()]//div[@role='button' and contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'send')]",
+            ),
+            (
+                By.XPATH,
+                "(//div[@role='dialog'])[last()]//*[@role='button' and (contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'send') or contains(translate(@data-tooltip,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'send') or contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'send'))]",
+            ),
+        ]
+
+        sent = False
         try:
-            WebDriverWait(self.driver, 12).until(
+            send_button = self._find_first_clickable(selectors, timeout=20)
+            try:
+                send_button.click()
+            except Exception:
+                self.driver.execute_script("arguments[0].click();", send_button)
+            sent = self._wait_for_gmail_send_outcome(timeout=12, initial_compose_count=initial_compose_count)
+        except Exception:
+            sent = False
+
+        if sent:
+            return
+
+        # Fallback: Gmail keyboard shortcut for send.
+        # Avoid hard-clicking the body because Gmail overlays can intercept it.
+        try:
+            active = self.driver.switch_to.active_element
+            active.send_keys(Keys.CONTROL, Keys.ENTER)
+        except Exception:
+            ActionChains(self.driver).key_down(Keys.CONTROL).send_keys(Keys.ENTER).key_up(Keys.CONTROL).perform()
+        if self._wait_for_gmail_send_outcome(timeout=12, initial_compose_count=initial_compose_count):
+            return
+
+        # Last attempt: direct shortcut on compose body element if available.
+        try:
+            body_el.send_keys(Keys.CONTROL, Keys.ENTER)
+        except Exception:
+            pass
+        if self._wait_for_gmail_send_outcome(timeout=12, initial_compose_count=initial_compose_count):
+            return
+
+        raise RuntimeError(
+            "Gmail did not confirm sending the message. It may have remained in Drafts."
+        )
+
+    def _wait_for_gmail_send_outcome(self, timeout: int, initial_compose_count: int) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._wait_for_gmail_sent_confirmation(timeout=1):
+                return True
+
+            # In many Gmail variants, the compose dialog closes immediately on successful send.
+            if self._count_open_compose_dialogs() < initial_compose_count:
+                return True
+
+            time.sleep(0.2)
+
+        return False
+
+    def _wait_for_gmail_sent_confirmation(self, timeout: int = 12) -> bool:
+        try:
+            WebDriverWait(self.driver, timeout).until(
                 EC.visibility_of_element_located(
                     (
                         By.XPATH,
-                        "//*[contains(., 'Message sent') or contains(., 'message sent')]",
+                        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'message sent')]",
                     )
                 )
             )
+            return True
         except Exception:
-            # If Gmail toast is missed due to timing/locale, continue best-effort.
-            pass
+            return False
+
+    def _count_open_compose_dialogs(self) -> int:
+        try:
+            dialogs = self.driver.find_elements(
+                By.XPATH,
+                "//div[@role='dialog'][.//input[@name='subjectbox'] or .//div[@aria-label='Message Body'] or .//textarea[@name='to']]",
+            )
+            return len(dialogs)
+        except Exception:
+            return 0
 
     def _find_first_visible(self, selectors: list[tuple[By, str]], timeout: int | None = None):
         wait = WebDriverWait(self.driver, timeout or self.config.wait_timeout)
@@ -599,6 +771,51 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
             raise last_error
         raise TimeoutException("No matching clickable element found.")
 
+    @staticmethod
+    def _dedupe_emails(emails: list[str]) -> list[str]:
+        seen = set()
+        deduped: list[str] = []
+        for email in emails:
+            normalized = (email or "").strip().lower()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        return deduped
+
+    def _fill_gmail_recipients(self, to_input, recipient_emails: list[str]) -> None:
+        for email in recipient_emails:
+            to_input.send_keys(email)
+            to_input.send_keys(Keys.ENTER)
+            time.sleep(0.05)
+
+    def _ensure_gmail_cc_input(self):
+        cc_input_selectors = [
+            (By.CSS_SELECTOR, "div[role='dialog'] textarea[name='cc']"),
+            (By.CSS_SELECTOR, "div[role='dialog'] input[aria-label='Cc recipients']"),
+            (By.CSS_SELECTOR, "textarea[name='cc']"),
+            (By.CSS_SELECTOR, "input[aria-label='Cc recipients']"),
+        ]
+
+        try:
+            return self._find_first_visible(cc_input_selectors, timeout=2)
+        except Exception:
+            pass
+
+        cc_button = self._find_first_clickable(
+            [
+                (By.XPATH, "//span[normalize-space(.)='Cc']"),
+                (By.XPATH, "//div[@role='dialog']//span[normalize-space(.)='Cc']"),
+                (
+                    By.XPATH,
+                    "//div[@role='dialog']//*[contains(@aria-label,'Cc') and (self::span or self::div or self::button)]",
+                ),
+            ],
+            timeout=6,
+        )
+        cc_button.click()
+        return self._find_first_visible(cc_input_selectors, timeout=6)
+
 
     def _build_plain_email_body(self, recipient: TeamRecipient, share_link: str, project_name: str) -> str:
         member_list_str = "\n".join([f"- {m.name} ({m.email})" for m in recipient.members])
@@ -619,10 +836,45 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
             
         return body
 
+    @staticmethod
+    def _set_clipboard_text(text: str) -> None:
+        try:
+            CF_UNICODETEXT = 13
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            if not user32.OpenClipboard(None):
+                return
+            try:
+                user32.EmptyClipboard()
+                data = (text + "\x00").encode("utf-16le")
+                handle = kernel32.GlobalAlloc(0x0002, len(data))
+                if not handle:
+                    return
+                pointer = kernel32.GlobalLock(handle)
+                if not pointer:
+                    return
+                try:
+                    ctypes.memmove(pointer, data, len(data))
+                finally:
+                    kernel32.GlobalUnlock(handle)
+                user32.SetClipboardData(CF_UNICODETEXT, handle)
+            finally:
+                user32.CloseClipboard()
+        except Exception:
+            pass
+
     def ensure_gmail_logged_in(self) -> None:
         print("🔍 Checking Gmail login status...")
         self.open_page(self.config.gmail_inbox_url)
-        time.sleep(2)
+
+        # Wait briefly for the page to settle before checking login state
+        try:
+            WebDriverWait(self.driver, 5).until(
+                lambda d: d.current_url and d.current_url != "about:blank"
+            )
+        except Exception:
+            pass
 
         if not self._gmail_login_required():
             print("✅ Gmail already logged in.")
@@ -643,7 +895,12 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
         print("✅ Gmail login completed. Session saved in browser profile.")
 
     def _gmail_login_required(self) -> bool:
-        current_url = (self.driver.current_url or "").lower()
+        try:
+            current_url = (self.driver.current_url or "").lower()
+        except Exception:
+            # If the window is closed or inaccessible, treat as login required.
+            return True
+
         if any(
             token in current_url
             for token in ["accounts.google.com", "servicelogin", "signin", "challenge"]
@@ -667,7 +924,11 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
         return True
 
     def _gmail_ready(self) -> bool:
-        current_url = (self.driver.current_url or "").lower()
+        try:
+            current_url = (self.driver.current_url or "").lower()
+        except Exception:
+            return False
+
         if "mail.google.com" not in current_url:
             return False
 
