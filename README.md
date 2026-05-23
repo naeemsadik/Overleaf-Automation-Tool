@@ -28,20 +28,64 @@ pip install -r requirements.txt
 
 ## CSV Format
 
-Input CSV must include these columns (case/spacing can vary):
+Input CSV supports three formats (case/spacing can vary):
 
-- `team_id`
-- `project_title`
-- `team leader name`
-- `team leader email`
+- Old single-row format:
+	- `team_id`
+	- `project_title`
+	- `team leader name`
+	- `team leader email`
+- New grouped format:
+	- `team_id`
+	- `project_title`
+	- `team_members`
+	- `emails`
+- Updated format:
+	- `group name`
+	- `title`
+	- `members`
+	- `member emails`
+	- `supervisor`
+	- `supervisor email` (optional; used for Gmail CC)
 
-Each row creates one project named `team_id - project_title` and sends one email to that row's team leader.
+In the new grouped format, the first row of a team contains `team_id` and `project_title`, and following rows for that team can leave those fields blank while providing additional `team_members` and `emails`. The script groups rows by team and sends one email per team to all collected member emails.
+
+Project naming now follows this pattern:
+
+`Group-Name || Title || Supervisor`
 
 ## Run
 
 ```powershell
 python main.py
 ```
+
+The app opens a simple PyQt window where you can pick the recipients CSV and start the automation. Chrome runs headless by default, and only opens visibly if Overleaf or Gmail requires manual login.
+
+UI notes:
+
+- Main UI theme color: `#f08801`.
+- Footer includes a black background with copyright text for UIU Computer Club Programming Department.
+- Circular logo and app icon use `ccl_pd.jpeg` (fallbacks: `logo.png`, `assets/ccl_pd.jpeg`, `assets/logo.png`). If no image is found, a branded fallback circle is shown.
+
+Team member handling:
+
+- Team size is not limited. Fewer than 5 or more than 5 members are both supported.
+- All valid email addresses found in each team's rows are collected and deduplicated.
+- One Gmail message is sent per team to all collected member emails.
+
+## Build EXE (Windows)
+
+1. Activate your environment.
+2. Run:
+
+```powershell
+./build_exe.ps1
+```
+
+Output executable:
+
+- `dist/OverleafAutomationUI.exe`
 
 ## Notes
 
