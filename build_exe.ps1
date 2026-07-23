@@ -3,10 +3,15 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $projectRoot
 
-Get-Process -Name "OverleafAutomationUI" -ErrorAction SilentlyContinue | Stop-Process -Force
-$existingExe = Join-Path $projectRoot "dist\OverleafAutomationUI.exe"
-if (Test-Path $existingExe) {
-    Remove-Item $existingExe -Force -ErrorAction SilentlyContinue
+Get-Process -Name "LeafPilot", "OverleafAutomationUI", "Overleaf Automation" -ErrorAction SilentlyContinue | Stop-Process -Force
+
+foreach ($path in @(
+    (Join-Path $projectRoot "dist"),
+    (Join-Path $projectRoot "build")
+)) {
+    if (Test-Path $path) {
+        Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 $pythonExe = Join-Path $projectRoot ".venv\Scripts\python.exe"
@@ -14,26 +19,21 @@ if (-not (Test-Path $pythonExe)) {
     $pythonExe = "python"
 }
 
-& $pythonExe -m pip install --upgrade pip
-& $pythonExe -m pip install pyinstaller pillow
+& $pythonExe -m pip install -r requirements.txt
 
-$iconPath = Join-Path $projectRoot "ccl_pd.jpeg"
-if (-not (Test-Path $iconPath)) {
-    throw "Icon file not found: $iconPath"
+$requiredAssets = @("logo.ico", "logo.png", "ccl_pd.jpeg", "LeafPilot.spec")
+foreach ($asset in $requiredAssets) {
+    $fullPath = Join-Path $projectRoot $asset
+    if (-not (Test-Path $fullPath)) {
+        throw "Required build file not found: $fullPath"
+    }
 }
 
-& $pythonExe -m PyInstaller `
-    --noconfirm `
-    --clean `
-    --windowed `
-    --onefile `
-    --collect-all selenium `
-    --collect-all webdriver_manager `
-    --hidden-import selenium.webdriver.chrome.webdriver `
-    --hidden-import selenium.webdriver.chromium.webdriver `
-    --add-data "$iconPath;." `
-    --icon "$iconPath" `
-    --name OverleafAutomationUI `
-    main.py
+& $pythonExe -m PyInstaller --noconfirm --clean LeafPilot.spec
 
-Write-Host "Build complete. EXE: .\dist\OverleafAutomationUI.exe"
+$exePath = Join-Path $projectRoot "dist\LeafPilot.exe"
+if (-not (Test-Path $exePath)) {
+    throw "Build failed: $exePath was not created."
+}
+
+Write-Host "Build complete. EXE: .\dist\LeafPilot.exe"

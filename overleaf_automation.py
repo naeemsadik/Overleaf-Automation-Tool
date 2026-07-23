@@ -1,6 +1,7 @@
 import time
 import csv
 import ctypes
+import re
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,11 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from config import AppConfig
+
+# Overleaf project names: keep readable, strip characters that break rename/UI.
+_INVALID_PROJECT_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_MAX_PROJECT_NAME_LEN = 150
+_HEADER_TEAM_ID_VALUES = frozenset({"teamid", "groupname", "team_id", "group_name"})
 
 
 class ManualLoginRequired(RuntimeError):
@@ -94,6 +100,13 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                 break
 
             project_name = self.build_project_name(recipient)
+            if not project_name:
+                print(f"\n⚠️ Skipping team with empty/invalid team id at index {index}.")
+                continue
+            if not recipient.members:
+                print(f"\n⚠️ Skipping {project_name}: no member emails found.")
+                continue
+
             member_names = ", ".join([m.name for m in recipient.members])
             print(
                 f"\n➡️ Processing {index}/{len(recipients)}: "
@@ -115,8 +128,19 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
         time.sleep(self.config.post_action_wait_seconds)
 
     def build_project_name(self, recipient: TeamRecipient) -> str:
-        supervisor = recipient.supervisor_name or "Supervisor"
-        return f"{recipient.team_id} || {recipient.project_title} || {supervisor}"
+        """Overleaf project name is the team/group id only (e.g. 261-001)."""
+        return self._sanitize_project_name(recipient.team_id)
+
+    @classmethod
+    def _sanitize_project_name(cls, raw: str) -> str:
+        name = (raw or "").strip()
+        if not name:
+            return ""
+        name = _INVALID_PROJECT_NAME_CHARS.sub("-", name)
+        name = re.sub(r"\s+", " ", name).strip(" .-_")
+        if len(name) > _MAX_PROJECT_NAME_LEN:
+            name = name[:_MAX_PROJECT_NAME_LEN].rstrip(" .-_")
+        return name
 
     def load_recipients(self) -> list[TeamRecipient]:
         csv_path = self.config.recipients_csv_path.expanduser()
@@ -142,7 +166,7 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                 
                 # Support multiple CSV header variants: legacy 'teamid'/'projecttitle',
                 # and newer 'groupname'/'title'. Also support 'members' + 'memberemails'.
-                team_id = row.get("teamid", "") or row.get("groupname", "")
+                team_id = (row.get("teamid", "") or row.get("groupname", "")).strip()
                 project_title = row.get("projecttitle", "") or row.get("title", "")
                 supervisor_name = row.get("supervisor", "")
 
@@ -156,8 +180,6 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                 # e.g. "011222086 (Alisha Johura), 011212001 (Abu Henaf...)". Extract names inside parentheses.
                 member_names = []
                 if member_cell:
-                    import re
-
                     # find names in parentheses
                     paren_names = re.findall(r"\(([^)]+)\)", member_cell)
                     if paren_names:
@@ -167,11 +189,10 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                         member_names = [m.strip() for m in member_cell.split(",") if m.strip()]
 
                 # Normalize emails: may be comma/semicolon/newline-separated.
-                # Use a real newline split instead of matching the letter 'n'.
                 member_emails = self._split_email_list(member_email_cell)
 
                 # Skip true header rows if they somehow ended up in data
-                if team_id.lower() == "team_id":
+                if self._normalize_header(team_id) in _HEADER_TEAM_ID_VALUES:
                     continue
 
                 if team_id:
@@ -192,6 +213,10 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                     current_cc = []
                     current_supervisor = supervisor_name or "Supervisor"
 
+                if not current_team_id:
+                    # Orphan member/email rows with no team id yet — ignore safely
+                    continue
+
                 if supervisor_name and not current_supervisor:
                     current_supervisor = supervisor_name
 
@@ -201,14 +226,14 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                 for i in range(max_count):
                     name = member_names[i] if i < len(member_names) else ""
                     email = member_emails[i] if i < len(member_emails) else ""
-                    if email:
+                    if email and "@" in email:
                         current_members.append(TeamMember(name=name or email, email=email, student_id=student_id))
 
                 if cc_val:
                     # Split by comma or semicolon if multiple CCs in one cell
                     ccs = self._split_email_list(cc_val)
                     for c in ccs:
-                        if c not in current_cc:
+                        if c not in current_cc and "@" in c:
                             current_cc.append(c)
 
             # Add last team
@@ -220,6 +245,8 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
                     members=current_members,
                     cc_emails=current_cc
                 ))
+
+        recipients = self._finalize_recipients(recipients)
 
         if not recipients:
             # Read a small sample of the CSV to help debugging
@@ -251,14 +278,57 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
             raise ValueError(detail)
         return recipients
 
+    def _finalize_recipients(self, recipients: list[TeamRecipient]) -> list[TeamRecipient]:
+        """Drop invalid/duplicate teams and warn about edge cases before automation runs."""
+        finalized: list[TeamRecipient] = []
+        seen_names: dict[str, str] = {}
+
+        for recipient in recipients:
+            project_name = self._sanitize_project_name(recipient.team_id)
+            if not project_name:
+                print(f"⚠️ Skipping team with empty/invalid team id (title={recipient.project_title!r}).")
+                continue
+
+            # Deduplicate members by email (case-insensitive) within the team
+            deduped_members: list[TeamMember] = []
+            seen_emails: set[str] = set()
+            for member in recipient.members:
+                key = member.email.strip().lower()
+                if not key or key in seen_emails:
+                    continue
+                seen_emails.add(key)
+                deduped_members.append(member)
+
+            name_key = project_name.casefold()
+            if name_key in seen_names:
+                print(
+                    f"⚠️ Duplicate team id {project_name!r} "
+                    f"(also seen as {seen_names[name_key]!r}). Skipping duplicate row group."
+                )
+                continue
+            seen_names[name_key] = project_name
+
+            if not deduped_members:
+                print(f"⚠️ Team {project_name} has no valid member emails. It will be skipped at run time.")
+
+            finalized.append(
+                TeamRecipient(
+                    team_id=project_name,
+                    project_title=recipient.project_title,
+                    supervisor_name=recipient.supervisor_name,
+                    members=deduped_members,
+                    cc_emails=recipient.cc_emails,
+                )
+            )
+
+        return finalized
+
     @staticmethod
     def _normalize_header(value: str) -> str:
         return "".join(ch for ch in value.lower() if ch.isalnum())
 
     @staticmethod
     def _split_email_list(value: str) -> list[str]:
-        import re
-
         parts = re.split(r"[;,\n]+", value or "")
         return [part.strip() for part in parts if part.strip()]
 
@@ -329,7 +399,9 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
         share_button.click()
 
     def rename_project(self, new_name: str) -> None:
+        new_name = self._sanitize_project_name(new_name)
         if not new_name:
+            print("⚠️ Empty project name after sanitization. Skipping rename.")
             return
 
         print(f"📝 Renaming project to: {new_name}")
@@ -399,8 +471,28 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
         self._click_copy_link_button()
 
         share_link = self._extract_share_link_fast()
+        if not self._looks_like_share_token_link(share_link):
+            raise RuntimeError(
+                "Could not capture an Overleaf share link. "
+                "Link sharing may not be enabled, or Overleaf UI changed. "
+                f"Last candidate: {share_link!r}"
+            )
         print(f"📋 Share link captured: {share_link}")
         return share_link
+
+    @classmethod
+    def _looks_like_share_token_link(cls, value: str) -> bool:
+        """True for share/read token links; false for editor/dashboard URLs."""
+        if not cls._looks_like_overleaf_link(value):
+            return False
+        text = value.strip().lower()
+        path = text.split("overleaf.com/", 1)[-1].split("?", 1)[0].strip("/")
+        if not path:
+            return False
+        # Editor / project pages must never be emailed as "share links".
+        if path.startswith("project/") or path.startswith("latex/") or path.startswith("docs"):
+            return False
+        return True
 
     def _click_turn_on_link_sharing(self) -> None:
         try:
@@ -443,11 +535,11 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
         deadline = time.time() + 2.5
         while time.time() < deadline:
             link = self._extract_share_link_quick_dom()
-            if self._looks_like_overleaf_link(link):
+            if self._looks_like_share_token_link(link):
                 return link.strip()
             time.sleep(0.12)
 
-        return self.driver.current_url
+        return (self.driver.current_url or "").strip()
 
     @staticmethod
     def _looks_like_overleaf_link(value: str) -> bool:
@@ -537,6 +629,11 @@ class OverleafProjectSharer(SeleniumWorkflowBase):
         all_emails = self._dedupe_emails([m.email for m in recipient.members])
         cc_emails = self._dedupe_emails(recipient.cc_emails)
         cc_emails = [email for email in cc_emails if email not in all_emails]
+
+        if not all_emails:
+            raise ValueError(
+                f"Cannot send email for project {project_name!r}: no valid member emails."
+            )
 
         print(f"📨 Sending Gmail message to: {', '.join(all_emails)}")
         if cc_emails:

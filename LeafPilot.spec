@@ -1,11 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('logo.png', '.'), ('ccl pd.jpeg', '.')]
+datas = [
+    ('logo.png', '.'),
+    ('logo.ico', '.'),
+    ('ccl_pd.jpeg', '.'),
+]
 binaries = []
-hiddenimports = []
+hiddenimports = [
+    'selenium.webdriver.chrome.webdriver',
+    'selenium.webdriver.chromium.webdriver',
+]
 tmp_ret = collect_all('selenium')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+datas += tmp_ret[0]
+binaries += tmp_ret[1]
+hiddenimports += tmp_ret[2]
 
 
 a = Analysis(

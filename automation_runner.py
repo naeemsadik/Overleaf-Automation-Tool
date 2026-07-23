@@ -32,6 +32,13 @@ def run_overleaf_automation(config: AppConfig) -> None:
 
         for recipient in recipients:
             project_name = automation.build_project_name(recipient)
+            if not project_name:
+                print("⚠️ Skipping team with empty/invalid team id.")
+                continue
+            if not recipient.members:
+                print(f"⚠️ Skipping {project_name}: no member emails found.")
+                continue
+
             share_link = ""
 
             while not share_link:

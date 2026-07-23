@@ -50,9 +50,7 @@ Input CSV supports three formats (case/spacing can vary):
 
 In the new grouped format, the first row of a team contains `team_id` and `project_title`, and following rows for that team can leave those fields blank while providing additional `team_members` and `emails`. The script groups rows by team and sends one email per team to all collected member emails.
 
-Project naming now follows this pattern:
-
-`Group-Name || Title || Supervisor`
+Project naming uses the team/group id only (for example `261-001`). Title and supervisor are not included in the Overleaf project name.
 
 ## Run
 
@@ -85,7 +83,7 @@ Team member handling:
 
 Output executable:
 
-- `dist/OverleafAutomationUI.exe`
+- `dist/LeafPilot.exe`
 
 ## Notes
 

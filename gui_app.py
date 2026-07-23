@@ -90,14 +90,23 @@ class LeafPilotGUI:
 
     def set_app_icon(self):
         try:
-            icon_path = resource_path("logo.png")
-            if os.path.exists(icon_path):
-                img = Image.open(icon_path)
+            # iconbitmap sets the taskbar and window icon on Windows
+            ico_path = resource_path("logo.ico")
+            if os.path.exists(ico_path):
+                self.root.iconbitmap(ico_path)
+        except Exception as e:
+            print(f"Warning: Could not set .ico icon: {e}")
+
+        try:
+            # iconphoto sets the icon used by the window manager / alt-tab
+            png_path = resource_path("logo.png")
+            if os.path.exists(png_path):
+                img = Image.open(png_path).convert("RGBA")
                 photo = ImageTk.PhotoImage(img)
                 self.root.iconphoto(True, photo)
-                self.app_logo = photo # Keep reference
+                self.app_logo = photo  # Keep reference to prevent GC
         except Exception as e:
-            print(f"Warning: Could not load application icon: {e}")
+            print(f"Warning: Could not set photo icon: {e}")
 
     def setup_ui(self):
         # Header Area
@@ -216,17 +225,20 @@ class LeafPilotGUI:
         content_inner = tk.Frame(footer_frame, bg=self.sidebar_color)
         content_inner.pack(expand=True)
 
+        # Load the club logo once and reuse for both sides
+        club_photo = None
         try:
-            footer_logo_path = resource_path("ccl pd.jpeg")
+            footer_logo_path = resource_path("ccl_pd.jpeg")
             if os.path.exists(footer_logo_path):
-                img = Image.open(footer_logo_path)
+                img = Image.open(footer_logo_path).convert("RGBA")
                 img = img.resize((45, 45), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                logo_label = tk.Label(content_inner, image=photo, bg=self.sidebar_color)
-                logo_label.image = photo # Keep reference
-                logo_label.pack(side=tk.LEFT, padx=10)
+                club_photo = ImageTk.PhotoImage(img)
+                self._footer_logo = club_photo  # Keep reference
         except Exception as e:
             print(f"Warning: Could not load footer logo: {e}")
+
+        if club_photo:
+            tk.Label(content_inner, image=club_photo, bg=self.sidebar_color).pack(side=tk.LEFT, padx=(0, 8))
 
         footer_text = "This Automation Tool is made by UIU Computer Club Programming Department."
         tk.Label(content_inner, text=footer_text, font=("Segoe UI Semibold", 10), fg="white", bg=self.sidebar_color).pack(side=tk.LEFT)
@@ -385,21 +397,39 @@ class LeafPilotGUI:
                         break
 
                     project_name = automation.build_project_name(recipient)
+                    if not project_name:
+                        print(f"\n⚠️ Skipping team with empty/invalid team id at index {index}.")
+                        continue
+                    if not recipient.members:
+                        print(f"\n⚠️ Skipping {project_name}: no member emails found.")
+                        continue
+
                     print(
                         f"\n➡️ Processing {index}/{len(recipients)}: "
                         f"{project_name} -> {len(recipient.members)} recipients"
                     )
 
-                    automation.open_project_or_template()
-                    automation.rename_project(project_name)
-                    automation.open_share_dialog()
-                    link = automation.set_link_sharing_to_edit_and_copy_link()
-                    automation.save_link_to_csv(link, project_name)
-                    automation.send_email_via_gmail(
-                        recipient=recipient,
-                        share_link=link,
-                        project_name=project_name,
-                    )
+                    try:
+                        automation.open_project_or_template()
+                        automation.rename_project(project_name)
+                        automation.open_share_dialog()
+                        link = automation.set_link_sharing_to_edit_and_copy_link()
+                        automation.save_link_to_csv(link, project_name)
+                        automation.send_email_via_gmail(
+                            recipient=recipient,
+                            share_link=link,
+                            project_name=project_name,
+                        )
+                    except Exception as team_error:
+                        print(f"\n❌ Failed on {project_name}: {team_error}")
+                        print("⏭️ Continuing with next team...")
+                        print(traceback.format_exc())
+                        # Recover to a known window if Gmail/tab handling left the driver mid-state.
+                        try:
+                            if automation.driver.window_handles:
+                                automation.driver.switch_to.window(automation.driver.window_handles[0])
+                        except Exception:
+                            pass
 
                     if self.mode_change_requested.is_set():
                         self.mode_change_requested.clear()
